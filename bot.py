@@ -9,13 +9,15 @@ import requests
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from bs4 import BeautifulSoup
 
 # ===================== КОНФИГ =====================
 CONFIG_FILE = "config.json"
 
 if not os.path.exists(CONFIG_FILE):
-    print("❌ Файл config.json не найден! Запусти install.sh или создай файл вручную.")
+    print("❌ Файл config.json не найден!")
     exit(1)
 
 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -34,17 +36,26 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=TOKEN, parse_mode="HTML")
+# Инициализация бота (новый синтаксис aiogram 3.7+)
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
 dp = Dispatcher()
 
 processing = False
 
 
-# ===================== ПАРСИНГ ФУНКЦИИ =====================
+# ===================== ПАРСИНГ =====================
 def get_all_gallery_pages(base_url: str) -> list[str]:
+    """Возвращает список всех страниц галереи."""
     base_url = re.sub(r'\?p=\d+', '', base_url).rstrip('/')
     try:
         r = requests.get(base_url, headers=HEADERS, timeout=15)
@@ -73,34 +84,58 @@ def get_all_gallery_pages(base_url: str) -> list[str]:
         pages.append(f"{base_url}/?p={p}")
     return pages
 
-
 def get_image_page_urls(gallery_page_url: str) -> list[str]:
+    """Собирает ссылки на страницы изображений (/s/...) с одной страницы галереи."""
     try:
-        r = requests.get(gallery_page_url, headers=HEADERS, timeout=15)
+        r = requests.get(gallery_page_url, headers=HEADERS, timeout=20)
         r.raise_for_status()
-    except Exception:
+    except Exception as e:
+        logger.error(f"Ошибка загрузки страницы галереи {gallery_page_url}: {e}")
         return []
+    
     soup = BeautifulSoup(r.text, "html.parser")
     urls = []
+
+    # Новые возможные селекторы (сайт мог поменять классы)
+    # Вариант 1: старый gdtm
     for div in soup.find_all("div", class_="gdtm"):
         a = div.find("a")
         if a and a.get("href"):
             urls.append(a["href"])
-    return urls
+
+    # Вариант 2: новый распространённый контейнер
+    if not urls:
+        for a in soup.select('a[href*="/s/"]'):
+            href = a.get("href")
+            if href and "/s/" in href:
+                urls.append(href)
+
+    # Вариант 3: через контейнер с id или class gdt
+    if not urls:
+        for div in soup.find_all("div", class_=re.compile(r'gdt')):
+            a = div.find("a")
+            if a and "/s/" in a.get("href", ""):
+                urls.append(a["href"])
+
+    logger.info(f"Найдено {len(urls)} ссылок на изображения на странице {gallery_page_url}")
+    return list(dict.fromkeys(urls))  # убираем возможные дубли
 
 
 def get_full_image_url(image_page_url: str) -> str | None:
+    """Получает прямую ссылку на полноразмерное изображение."""
     try:
         r = requests.get(image_page_url, headers=HEADERS, timeout=15)
         r.raise_for_status()
     except Exception:
         return None
+    
     soup = BeautifulSoup(r.text, "html.parser")
     img = soup.find("img", id="img")
     return img["src"] if img and img.get("src") else None
 
 
 def download_image(img_url: str) -> bytes:
+    """Скачивает изображение в память."""
     r = requests.get(img_url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return r.content
@@ -112,6 +147,7 @@ async def process_gallery(message: types.Message, gallery_url: str):
     processing = True
     try:
         await message.answer("🔍 <b>Нахожу страницы галереи...</b>")
+        
         gallery_pages = get_all_gallery_pages(gallery_url)
         await message.answer(f"📄 <b>Найдено страниц:</b> {len(gallery_pages)}")
 
@@ -130,6 +166,7 @@ async def process_gallery(message: types.Message, gallery_url: str):
 
         for i, img_page_url in enumerate(all_image_pages, 1):
             await message.answer(f"📸 Скачиваю фото <b>{i}/{len(all_image_pages)}</b>...")
+            
             full_url = get_full_image_url(img_page_url)
             if not full_url:
                 await message.answer(f"⚠️ Пропущено фото {i}")
@@ -151,6 +188,7 @@ async def process_gallery(message: types.Message, gallery_url: str):
             await asyncio.sleep(1.5)
 
         await message.answer("✅ <b>Все изображения отправлены!</b>")
+        
     except Exception as e:
         logger.exception("Критическая ошибка")
         await message.answer(f"❌ Ошибка: {str(e)[:300]}")
@@ -201,4 +239,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Бот остановлен")
     except Exception as e:
-        logger.critical(f"Ошибка: {e}")
+        logger.critical(f"Критическая ошибка: {e}")
